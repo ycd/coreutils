@@ -61,9 +61,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         None => vec!["-".to_owned()],
     };
 
-    more(files);
-
-    0
+    more(files)
 }
 
 #[cfg(all(unix, not(target_os = "fuchsia")))]
@@ -116,7 +114,7 @@ fn reset_term(term: &mut redox_termios::Termios) {
     let _ = syscall::close(fd);
 }
 
-fn more(files: Vec<String>) -> i64 {
+fn more(files: Vec<String>) -> i32 {
     let mut exit_code = 0;
 
     let mut term = setup_term();
