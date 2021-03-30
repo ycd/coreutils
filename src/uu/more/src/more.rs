@@ -10,8 +10,8 @@
 #[macro_use]
 extern crate uucore;
 
-use std::fs::File;
 use std::io::{stdin, stdout, BufRead, BufReader, Read, Write};
+use std::{fs::File, path::Path};
 
 #[cfg(all(unix, not(target_os = "fuchsia")))]
 extern crate nix;
@@ -51,12 +51,17 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         .get_matches_from(args);
 
     // FixME: fail without panic for now; but `more` should work with no arguments (ie, for piped input)
-    if let None | Some("-") = matches.value_of(options::FILE) {
-        println!("{}: incorrect usage", executable!());
-        return 1;
-    }
+    // if let None | Some("-") = matches.value_of(options::FILE) {
+    //    println!("{}: incorrect usage", executable!());
+    //    return 1;
+    // }
 
-    more(matches);
+    let files: Vec<String> = match matches.values_of(options::FILE) {
+        Some(v) => v.map(|f| f.to_owned()).collect(),
+        None => vec!["-".to_owned()],
+    };
+
+    more(files);
 
     0
 }
@@ -111,37 +116,59 @@ fn reset_term(term: &mut redox_termios::Termios) {
     let _ = syscall::close(fd);
 }
 
-fn more(matches: ArgMatches) {
-    let mut f: Box<dyn BufRead> = match matches.value_of(options::FILE) {
-        None | Some("-") => Box::new(BufReader::new(stdin())),
-        Some(filename) => Box::new(BufReader::new(File::open(filename).unwrap())),
-    };
-    let mut buffer = [0; 1024];
+fn more(files: Vec<String>) -> i64 {
+    let mut exit_code = 0;
 
     let mut term = setup_term();
+    for file in files.iter() {
+        let mut f: Box<dyn BufRead> = {
+            if file == "-" {
+                Box::new(BufReader::new(stdin()))
+            } else {
+                let path = Path::new(file);
 
-    let mut end = false;
-    while let Ok(sz) = f.read(&mut buffer) {
-        if sz == 0 {
-            break;
-        }
-        stdout().write_all(&buffer[0..sz]).unwrap();
-        for byte in std::io::stdin().bytes() {
-            match byte.unwrap() {
-                b' ' => break,
-                b'q' | 27 => {
-                    end = true;
-                    break;
+                if path.is_dir() {
+                    show_error!("cannot read '{}': Is a directory", file);
+                    exit_code = 1;
+                    continue;
                 }
-                _ => (),
+                if !path.metadata().is_ok() {
+                    show_error!("cannot open '{}': No such file or directory", file);
+                    exit_code = 1;
+                    continue;
+                }
+
+                Box::new(BufReader::new(File::open(path).unwrap()))
+            }
+        };
+
+        let mut buffer = [0; 1024];
+
+        let mut end = false;
+
+        while let Ok(sz) = f.read(&mut buffer) {
+            if sz == 0 {
+                break;
+            }
+            stdout().write_all(&buffer[0..sz]).unwrap();
+            for byte in std::io::stdin().bytes() {
+                match byte.unwrap() {
+                    b' ' => break,
+                    b'q' | 27 => {
+                        end = true;
+                        break;
+                    }
+                    _ => (),
+                }
+            }
+
+            if end {
+                break;
             }
         }
-
-        if end {
-            break;
-        }
+        reset_term(&mut term);
+        println!();
     }
 
-    reset_term(&mut term);
-    println!();
+    exit_code
 }
