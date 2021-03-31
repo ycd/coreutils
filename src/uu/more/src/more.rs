@@ -117,7 +117,6 @@ fn reset_term(term: &mut redox_termios::Termios) {
 fn more(files: Vec<String>) -> i32 {
     let mut exit_code = 0;
 
-    let mut term = setup_term();
     for file in files.iter() {
         let mut f: Box<dyn BufRead> = {
             if file == "-" {
@@ -139,6 +138,8 @@ fn more(files: Vec<String>) -> i32 {
                 Box::new(BufReader::new(File::open(path).unwrap()))
             }
         };
+
+        let mut term = setup_term();
 
         let mut buffer = [0; 1024];
 
