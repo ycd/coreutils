@@ -135,21 +135,142 @@ fn filetime_to_datetime(ft: &FileTime) -> Option<DateTime<Local>> {
     Some(DateTime::from_timestamp(ft.unix_seconds(), ft.nanoseconds())?.into())
 }
 
+fn try_parse_operand_timestamp(s: &str) -> Option<FileTime> {
+    if !s.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+
+    let now = Local::now();
+    let current_year = now.year();
+
+    let naive_dt = match s.len() {
+        12 => {
+            // YYYYMMDDhhmm - 202404201145 - 2024-04-20 11:45
+            NaiveDateTime::parse_from_str(s, format::YYYYMMDDHHMM).ok()?
+        }
+        10 => {
+            // MMDDhhmmYY - 0420114524 - 2024-04-20 11:45
+            let mm_str = &s[0..2];
+            let dd_str = &s[2..4];
+            let hh_str = &s[4..6];
+            let min_str = &s[6..8];
+            let yy_str = &s[8..10];
+
+            let yy_val = yy_str.parse::<i32>().ok()?;
+            // as defined in POSIX or X/Open standard
+            // values 69-99 are mapped to 1969-1999
+            // values 0–68 are mapped to 2000–2068.
+            // values 100–1899 are always illegal
+            let year = if yy_val < 69 {
+                2000 + yy_val
+            } else {
+                1900 + yy_val
+            };
+            let month = mm_str.parse::<u32>().ok()?;
+            let day = dd_str.parse::<u32>().ok()?;
+            let hour = hh_str.parse::<u32>().ok()?;
+            let minute = min_str.parse::<u32>().ok()?;
+
+            let date = NaiveDate::from_ymd_opt(year, month, day)?;
+            let time = NaiveTime::from_hms_opt(hour, minute, 0)?;
+            NaiveDateTime::new(date, time)
+        }
+        8 => {
+            // MMDDhhmm - 202404201145 - 2024-04-20 11:45
+            let mm_str = &s[0..2];
+            let dd_str = &s[2..4];
+            let hh_str = &s[4..6];
+            let min_str = &s[6..8];
+
+            let month = mm_str.parse::<u32>().ok()?;
+            let day = dd_str.parse::<u32>().ok()?;
+            let hour = hh_str.parse::<u32>().ok()?;
+            let minute = min_str.parse::<u32>().ok()?;
+
+            let date = NaiveDate::from_ymd_opt(current_year, month, day)?;
+            let time = NaiveTime::from_hms_opt(hour, minute, 0)?;
+            NaiveDateTime::new(date, time)
+        }
+        _ => return None,
+    };
+
+    match Local.from_local_datetime(&naive_dt) {
+        LocalResult::Single(mut dt) => {
+            if let (Some(_dt_plus_hour), Some(dt_plus_hour_minus_hour)) = (
+                dt.checked_add_signed(Duration::hours(1)),
+                dt.checked_add_signed(Duration::hours(1))
+                    .and_then(|d| d.checked_sub_signed(Duration::hours(1))),
+            ) {
+                if dt.hour() != dt_plus_hour_minus_hour.hour() {
+                    let original_seconds = dt.timestamp();
+                    let after_dst_check_seconds = dt_plus_hour_minus_hour.timestamp();
+
+                    if after_dst_check_seconds > original_seconds {
+                        // time doesn't exist, use the time after transition
+                        dt = dt_plus_hour_minus_hour;
+                    } else if after_dst_check_seconds < original_seconds {
+                        // time is ambiguous, use the first occurrence so dt remains unchanged
+                    } else {
+                        // very unlikely case so rely on the chrono's DST adjustment handling in this case
+                        dt = dt_plus_hour_minus_hour;
+                    }
+                }
+            }
+
+            Some(datetime_to_filetime(&dt))
+        }
+        LocalResult::Ambiguous(earlier, _later) => Some(datetime_to_filetime(&earlier)),
+        LocalResult::None => None,
+    }
+}
+
 #[uucore::main]
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let matches = uu_app().try_get_matches_from(args)?;
 
-    let files: Vec<InputFile> = matches
+    let all_potential_filenames: Vec<OsString> = matches
         .get_many::<OsString>(ARG_FILES)
-        .ok_or_else(|| {
-            USimpleError::new(
-                1,
-                format!(
-                    "missing file operand\nTry '{} --help' for more information.",
-                    uucore::execution_phrase()
-                ),
-            )
-        })?
+        .map(|v| v.cloned().collect())
+        .unwrap_or_default();
+
+    let mut timestamp_from_operand: Option<FileTime> = None;
+    let final_filenames: Vec<OsString>;
+
+    let has_explicit_time_source = matches.contains_id(options::sources::REFERENCE)
+        || matches.contains_id(options::sources::TIMESTAMP)
+        || matches.contains_id(options::sources::DATE);
+
+    if !has_explicit_time_source && !all_potential_filenames.is_empty() {
+        if let Some(first_operand_str) = all_potential_filenames[0].to_str() {
+            if let Some(parsed_time) = try_parse_operand_timestamp(first_operand_str) {
+                if all_potential_filenames.len() > 1 {
+                    timestamp_from_operand = Some(parsed_time);
+                    final_filenames = all_potential_filenames[1..].to_vec();
+                } else {
+                    final_filenames = all_potential_filenames;
+                }
+            } else {
+                final_filenames = all_potential_filenames;
+            }
+        } else {
+            final_filenames = all_potential_filenames;
+        }
+    } else {
+        final_filenames = all_potential_filenames;
+    }
+
+    if final_filenames.is_empty() {
+        return Err(USimpleError::new(
+            1,
+            format!(
+                "missing file operand\nTry '{} --help' for more information.",
+                uucore::execution_phrase()
+            ),
+        ));
+    }
+
+    let files: Vec<InputFile> = final_filenames
+        .into_iter()
         .map(|filename| {
             if filename == "-" {
                 InputFile::Stdout
@@ -159,18 +280,17 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
         })
         .collect();
 
-    let no_deref = matches.get_flag(options::NO_DEREF);
-
-    let reference = matches.get_one::<OsString>(options::sources::REFERENCE);
-    let timestamp = matches.get_one::<String>(options::sources::TIMESTAMP);
-
-    let source = if let Some(reference) = reference {
+    let source = if let Some(ts) = timestamp_from_operand {
+        Source::Timestamp(ts)
+    } else if let Some(reference) = matches.get_one::<OsString>(options::sources::REFERENCE) {
         Source::Reference(PathBuf::from(reference))
-    } else if let Some(ts) = timestamp {
-        Source::Timestamp(parse_timestamp(ts)?)
+    } else if let Some(ts_str) = matches.get_one::<String>(options::sources::TIMESTAMP) {
+        Source::Timestamp(parse_timestamp(ts_str)?)
     } else {
         Source::Now
     };
+
+    let no_deref = matches.get_flag(options::NO_DEREF);
 
     let date = matches
         .get_one::<String>(options::sources::DATE)
@@ -313,8 +433,11 @@ pub fn touch(files: &[InputFile], opts: &Options) -> Result<(), TouchError> {
             (atime, mtime)
         }
         Source::Now => {
-            let now = datetime_to_filetime(&Local::now());
-            (now, now)
+            let now_val = Local::now();
+            (
+                datetime_to_filetime(&now_val),
+                datetime_to_filetime(&now_val),
+            )
         }
         &Source::Timestamp(ts) => (ts, ts),
     };

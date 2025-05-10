@@ -5,6 +5,7 @@
 // spell-checker:ignore (formats) cymdhm cymdhms mdhm mdhms ymdhm ymdhms datetime mktime
 
 use crate::common::util::{AtPath, TestScenario};
+use chrono::Datelike;
 #[cfg(not(target_os = "freebsd"))]
 use filetime::set_symlink_file_times;
 use filetime::FileTime;
@@ -916,4 +917,57 @@ fn test_touch_reference_symlink_with_no_deref() {
         .succeeds();
     // Times should be taken from the symlink, not the destination
     assert_eq!((time, time), get_symlink_times(&at, arg));
+}
+
+#[test]
+fn test_touch_operand_as_timestamp() {
+    let (at, mut ucmd) = at_and_ucmd!();
+
+    let timestamp_str = "03151030"; // March 15, 10:30 current year
+    let filename = "file_operand_ts.txt";
+
+    let current_year = chrono::Local::now().year();
+    let expected_datetime_str = format!("{}{}", current_year, timestamp_str);
+    let expected_file_time = str_to_filetime("%Y%m%d%H%M", &expected_datetime_str);
+
+    ucmd.args(&[timestamp_str, filename]).succeeds().no_stderr();
+
+    assert!(at.file_exists(filename));
+    let (atime, mtime) = get_file_times(&at, filename);
+    assert_eq!(atime, expected_file_time);
+    assert_eq!(mtime, expected_file_time);
+
+    // Ensure the timestamp string itself was not created as a file
+    assert!(!at.file_exists(timestamp_str));
+
+    let _ = remove_file(at.plus(filename));
+}
+
+#[test]
+fn test_touch_single_operand_like_timestamp_is_file() {
+    let filenames_to_test: Vec<&str> = vec![
+        "04201145",         // MMDDHHMM
+        "202404201145",     // YYYYMMDDHHMM
+        "2024-04-20 11:45", // YYYY-MM-DD HH:MM
+        "2024-04-20",       // YYYY-MM-DD
+        "2024-04",          // YYYY-MM
+        "2024",             // YYYY
+        "20240420",         // YYYYMMDD
+        "202404",           // YYYYMM
+        "2024",             // YYYY
+        "0420",             // MMDD
+        "202404",           // YYYYMM
+        "2024",             // YYYY
+        "04",               // MM
+    ];
+
+    for filename_str in filenames_to_test {
+        let (at, mut ucmd) = at_and_ucmd!();
+
+        ucmd.arg(filename_str).succeeds().no_stderr();
+
+        assert!(at.file_exists(filename_str));
+
+        let _ = remove_file(at.plus(filename_str));
+    }
 }
